@@ -1,0 +1,834 @@
+openapi: "3.0.3"
+info:
+  title: identity_service API
+  version: "1.0.0"
+  description: >
+    Accounts, email verification, sign-in, session and refresh-token management,
+    password reset, public profile lookup, and access-token signing-key publication
+    for the Community Chat & Voice Platform. Peers verify access tokens locally
+    against the published JWKS; no peer calls this service at request time.
+servers:
+  - url: /
+
+tags:
+  - name: auth
+    description: Registration, verification, sign-in, token refresh, sign-out
+  - name: password-reset
+    description: Password reset request and confirmation
+  - name: sessions
+    description: Active session visibility and revocation
+  - name: users
+    description: Own profile and public profile lookup
+  - name: keys
+    description: Public token verification keys (JWKS)
+  - name: health
+    description: Liveness and readiness probes
+
+paths:
+  /auth/register:
+    post:
+      operationId: registerUser
+      summary: Create an account and send a verification email
+      tags: [auth]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        "201":
+          description: Account created; verification email queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisterResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "409":
+          description: Email or username already in use
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                email_already_registered:
+                  value: { error: email_already_registered, detail: "This email is already registered." }
+                username_taken:
+                  value: { error: username_taken, detail: "This username is already taken." }
+        "422":
+          $ref: '#/components/responses/UnprocessableEntity'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /auth/verify-email:
+    post:
+      operationId: verifyEmail
+      summary: Confirm email ownership with a single-use token
+      tags: [auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyEmailRequest'
+      responses:
+        "200":
+          description: Email verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerifyEmailResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "409":
+          description: Account already verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example: { error: already_verified, detail: "This email is already verified." }
+        "410":
+          description: Token expired, unknown, or already used
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                verification_link_expired:
+                  value: { error: verification_link_expired, detail: "This verification link is no longer valid." }
+                verification_link_used:
+                  value: { error: verification_link_used, detail: "This verification link was already used." }
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /auth/verify-email/resend:
+    post:
+      operationId: resendVerificationEmail
+      summary: Request a fresh verification email (always 202, no enumeration)
+      tags: [auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResendVerificationRequest'
+      responses:
+        "202":
+          description: Request accepted; email sent when the account exists and is unverified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptedResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "422":
+          $ref: '#/components/responses/UnprocessableEntity'
+        "500":
+          $ref: '#/components/responses/InternalError'
+        "503":
+          $ref: '#/components/responses/EmailUnavailable'
+
+  /auth/login:
+    post:
+      operationId: login
+      summary: Sign in and receive an access token plus a rotating refresh cookie
+      tags: [auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        "200":
+          description: Signed in; refresh token also set as HttpOnly cookie
+          headers:
+            Set-Cookie:
+              description: "refresh_token=<opaque>; HttpOnly; Secure; SameSite=Strict; Path=/auth"
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example: { error: invalid_credentials, detail: "Email or password is incorrect." }
+        "403":
+          description: Email not verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example: { error: email_not_verified, detail: "Verify your email before signing in." }
+        "422":
+          $ref: '#/components/responses/UnprocessableEntity'
+        "429":
+          description: Temporarily locked after repeated failures
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example: { error: locked, detail: "Too many attempts. Try again in 15 minutes." }
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /auth/refresh:
+    post:
+      operationId: refreshSession
+      summary: Rotate the refresh token and issue a new access token
+      tags: [auth]
+      parameters:
+        - $ref: '#/components/parameters/RefreshCookie'
+      responses:
+        "200":
+          description: New access token and rotated refresh cookie
+          headers:
+            Set-Cookie:
+              description: "refresh_token=<opaque>; HttpOnly; Secure; SameSite=Strict; Path=/auth"
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        "401":
+          description: Missing, expired, or reused refresh token (reuse revokes the session family)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalid_refresh_token:
+                  value: { error: invalid_refresh_token, detail: "Sign in again." }
+                session_revoked:
+                  value: { error: session_revoked, detail: "This session was revoked. Sign in again." }
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /auth/logout:
+    post:
+      operationId: logout
+      summary: End the current session
+      tags: [auth]
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: Session revoked; refresh cookie cleared
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /auth/logout-all:
+    post:
+      operationId: logoutAll
+      summary: End every session of the current user
+      tags: [auth]
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: All sessions revoked
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /auth/password-reset/request:
+    post:
+      operationId: requestPasswordReset
+      summary: Start a password reset (always 202, no enumeration)
+      tags: [password-reset]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordResetRequest'
+      responses:
+        "202":
+          description: Request accepted; email sent when the account exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptedResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "422":
+          $ref: '#/components/responses/UnprocessableEntity'
+        "500":
+          $ref: '#/components/responses/InternalError'
+        "503":
+          $ref: '#/components/responses/EmailUnavailable'
+
+  /auth/password-reset/confirm:
+    post:
+      operationId: confirmPasswordReset
+      summary: Complete a password reset; revokes all sessions
+      tags: [password-reset]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordResetConfirmRequest'
+      responses:
+        "204":
+          description: Password replaced; all sessions revoked
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "410":
+          description: Reset token expired, unknown, or already used
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example: { error: reset_link_expired, detail: "This reset link is no longer valid." }
+        "422":
+          $ref: '#/components/responses/UnprocessableEntity'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /sessions:
+    get:
+      operationId: listSessions
+      summary: List the caller's active sessions
+      tags: [sessions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        "200":
+          description: Active sessions of the caller
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionList'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /sessions/{session_id}:
+    delete:
+      operationId: revokeSession
+      summary: End a specific session of the caller
+      tags: [sessions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Session and its refresh family revoked
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          description: Session unknown or not owned by the caller
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example: { error: session_not_found, detail: "No such active session." }
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /users/me:
+    get:
+      operationId: getOwnProfile
+      summary: Fetch the caller's own profile
+      tags: [users]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Own profile (includes email)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OwnProfile'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "500":
+          $ref: '#/components/responses/InternalError'
+    patch:
+      operationId: updateOwnProfile
+      summary: Update the caller's display name
+      tags: [users]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateProfileRequest'
+      responses:
+        "200":
+          description: Updated profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OwnProfile'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "422":
+          $ref: '#/components/responses/UnprocessableEntity'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /users/lookup:
+    get:
+      operationId: lookupUserByUsername
+      summary: Resolve a username to a public profile
+      tags: [users]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: username
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 32
+      responses:
+        "200":
+          description: Public profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicProfile'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          description: No user with that username
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example: { error: user_not_found, detail: "No user with that username." }
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /users:
+    get:
+      operationId: listUsersByIds
+      summary: Batch-resolve public profiles by user ids (up to 100)
+      tags: [users]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: ids
+          in: query
+          required: true
+          description: Comma-separated user ids; duplicates ignored; unknown ids omitted from the result
+          schema:
+            type: array
+            maxItems: 100
+            items:
+              type: string
+              format: uuid
+          style: form
+          explode: false
+      responses:
+        "200":
+          description: Public profiles of the found users
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicProfileList'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "422":
+          $ref: '#/components/responses/UnprocessableEntity'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /.well-known/jwks.json:
+    get:
+      operationId: getJwks
+      summary: Public access-token verification keys (current and next)
+      tags: [keys]
+      security: []
+      responses:
+        "200":
+          description: JSON Web Key Set
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Jwks'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /healthz:
+    get:
+      operationId: getLiveness
+      summary: Liveness probe
+      tags: [health]
+      responses:
+        "200":
+          description: Process is alive
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /readyz:
+    get:
+      operationId: getReadiness
+      summary: Readiness probe (PostgreSQL and Kafka producer reachable)
+      tags: [health]
+      responses:
+        "200":
+          description: Ready to serve traffic
+        "503":
+          description: A critical dependency is not ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Client-supplied key so a retried registration does not create a duplicate account
+      schema:
+        type: string
+        maxLength: 64
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+    RefreshCookie:
+      name: refresh_token
+      in: cookie
+      required: true
+      schema:
+        type: string
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Short-lived access token issued by this service (claims sub, sid, email_verified, exp, iat, iss, aud)
+
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example: { error: bad_request, detail: "The request body could not be parsed." }
+    Unauthorized:
+      description: Missing, invalid, or expired access token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example: { error: unauthorized, detail: "Sign in to continue." }
+    UnprocessableEntity:
+      description: Validation failed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example: { error: validation_failed, detail: "One or more fields are invalid." }
+    InternalError:
+      description: Unexpected server error (no internal details exposed)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example: { error: internal_error, detail: "Something went wrong. Try again." }
+    EmailUnavailable:
+      description: Email provider unavailable after bounded retries
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example: { error: email_unavailable, detail: "We couldn't send the email. Try again." }
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable error code, snake_case
+        detail:
+          type: string
+          description: Human-readable explanation
+
+    AcceptedResponse:
+      type: object
+      required: [accepted]
+      properties:
+        accepted:
+          type: boolean
+          example: true
+
+    RegisterRequest:
+      type: object
+      required: [email, username, display_name, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        username:
+          type: string
+          minLength: 2
+          maxLength: 32
+          pattern: '^[a-z0-9_.-]+$'
+          description: Matched case-insensitively for uniqueness
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 64
+        password:
+          type: string
+          minLength: 10
+          maxLength: 128
+          format: password
+
+    RegisterResponse:
+      type: object
+      required: [user_id, verification_pending]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        verification_pending:
+          type: boolean
+          example: true
+
+    VerifyEmailRequest:
+      type: object
+      required: [token]
+      properties:
+        token:
+          type: string
+          minLength: 1
+          maxLength: 512
+
+    VerifyEmailResponse:
+      type: object
+      required: [user_id, email_verified]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        email_verified:
+          type: boolean
+          example: true
+
+    ResendVerificationRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          minLength: 1
+          maxLength: 128
+          format: password
+        device_label:
+          type: string
+          maxLength: 100
+          description: Human-readable device name shown in the session list
+
+    LoginResponse:
+      type: object
+      required: [access_token, token_type, expires_in, user]
+      properties:
+        access_token:
+          type: string
+          description: Signed JWT (short-lived, ~10 minutes)
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_in:
+          type: integer
+          description: Access-token lifetime in seconds
+          example: 600
+        user:
+          $ref: '#/components/schemas/PublicProfile'
+
+    PasswordResetRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+
+    PasswordResetConfirmRequest:
+      type: object
+      required: [token, new_password]
+      properties:
+        token:
+          type: string
+          minLength: 1
+          maxLength: 512
+        new_password:
+          type: string
+          minLength: 10
+          maxLength: 128
+          format: password
+
+    Session:
+      type: object
+      required: [session_id, device_label, created_at, last_seen_at, is_current]
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        device_label:
+          type: string
+          maxLength: 100
+        created_at:
+          type: string
+          format: date-time
+        last_seen_at:
+          type: string
+          format: date-time
+        is_current:
+          type: boolean
+
+    SessionList:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Session'
+        next_cursor:
+          type: string
+          nullable: true
+
+    OwnProfile:
+      type: object
+      required: [user_id, email, username, display_name, email_verified]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        username:
+          type: string
+        display_name:
+          type: string
+        email_verified:
+          type: boolean
+
+    UpdateProfileRequest:
+      type: object
+      required: [display_name]
+      properties:
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 64
+
+    PublicProfile:
+      type: object
+      required: [user_id, username, display_name]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        username:
+          type: string
+        display_name:
+          type: string
+
+    PublicProfileList:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/PublicProfile'
+
+    Jwk:
+      type: object
+      required: [kty, kid, alg, use, n, e]
+      properties:
+        kty:
+          type: string
+          enum: [RSA]
+        kid:
+          type: string
+        alg:
+          type: string
+          enum: [RS256]
+        use:
+          type: string
+          enum: [sig]
+        n:
+          type: string
+          description: Base64url-encoded RSA modulus
+        e:
+          type: string
+          description: Base64url-encoded RSA public exponent
+
+    Jwks:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          description: Current key first, then the next (pre-published for rotation)
+          items:
+            $ref: '#/components/schemas/Jwk'

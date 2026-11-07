@@ -1,0 +1,9 @@
+DROP TABLE IF EXISTS event_outbox;
+DROP TABLE IF EXISTS login_attempts;
+DROP TABLE IF EXISTS signing_keys;
+DROP TABLE IF EXISTS refresh_tokens;
+DROP TABLE IF EXISTS sessions;
+DROP TABLE IF EXISTS password_reset_tokens;
+DROP TABLE IF EXISTS email_verification_tokens;
+DROP TABLE IF EXISTS credentials;
+DROP TABLE IF EXISTS users;

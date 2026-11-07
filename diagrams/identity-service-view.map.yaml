@@ -1,0 +1,258 @@
+schema_version: 2
+diagram_id: identity-service-view
+mode: service
+orientation: LR
+scope: identity_service service view for the Community Chat & Voice Platform (accounts,
+  sign-in, sessions, refresh rotation, password reset, profiles, JWKS and account
+  events).
+sources:
+- path: docs/architecture.md
+  sha256: 8cab5a08ea74499b3d24f069d57c52de0dbd58ba1af3e5bf12c463a40b6ff19f
+- path: docs/decisions/ADR-001-refresh-token-rotation-family.md
+  sha256: 91cb97d155dc1e6f9cae199322ddf0db795f4e787db089ce49a531b60d87dd9a
+- path: docs/openapi_spec.yaml
+  sha256: ac351c29a6b12dd2688bd2c0fd613ae5e1c2e3cdf8d5c3e2a3e540a0297a38a1
+- path: docs/user_stories.md
+  sha256: b7c6856eae54a470a001ee1bab4bf7328ac845938e6d20dd307396fac6882274
+entities:
+- id: clients
+  label: Frontend web and mobile clients
+  kind: annotation
+  role: inbound
+  row: 302
+  evidence:
+  - path: docs/architecture.md
+    quote: '| Auth handlers | HTTP surface for `/auth/*` (register, verify, login,
+      refresh, logout, logout-all, password reset) |'
+  - path: docs/openapi_spec.yaml
+    quote: Accounts, email verification, sign-in, session and refresh-token management,
+- id: peers
+  label: Peer services
+  kind: annotation
+  role: inbound
+  row: 372
+  evidence:
+  - path: docs/architecture.md
+    quote: used by the frontend and peer services to render names
+  - path: docs/architecture.md
+    quote: '`GET /users/lookup?username=` and `GET /users?ids=`'
+- id: verifiers
+  label: JWKS verifiers
+  kind: annotation
+  role: inbound
+  row: 442
+  evidence:
+  - path: docs/user_stories.md
+    quote: Given the service is running, when the JWKS endpoint is fetched, then it
+      returns the current and next public keys in standard JWKS form, unauthenticated.
+  - path: docs/architecture.md
+    quote: publishes current + next public keys at `GET /.well-known/jwks.json` so
+      every peer verifies tokens **locally** (no runtime call to this service).
+- id: svc
+  name: identity_service
+  label: identity_service
+  kind: service
+  technology: kubernetes-pod
+  role: service
+  row: 260
+  evidence:
+  - path: docs/architecture.md
+    quote: '**Statelessness:** all state lives in PostgreSQL; no local disk or in-memory
+      session state. Safe with `replicas >= 1`;'
+  - path: docs/architecture.md
+    quote: '`identity_service` owns everything about **who a user is and how they
+      prove it**:'
+- id: db
+  label: identity PostgreSQL
+  kind: database
+  technology: postgresql
+  role: outbound
+  row: 313
+  evidence:
+  - path: docs/architecture.md
+    quote: All tables are owned by this service.
+  - path: docs/architecture.md
+    quote: PostgreSQL Database Schema
+- id: resend
+  label: Resend email provider
+  kind: annotation
+  external: true
+  external_role: dependency
+  role: outbound
+  row: 355
+  evidence:
+  - path: docs/architecture.md
+    quote: Outbound only; **no inbound webhook at launch**.
+  - path: docs/architecture.md
+    quote: 'Emails: verification (on register / resend), password reset, password-changed
+      confirmation.'
+- id: events
+  name: identity_events
+  label: Kafka
+  kind: broker
+  technology: kafka
+  role: outbound
+  row: 70
+  evidence:
+  - path: docs/architecture.md
+    quote: 'Topic **`identity_events`**, key = `user_id`, event **`user_account_changed`
+      (EVT-001)**, published on: email verification, display-name update, email change,
+      deactivation.'
+  - path: docs/architecture.md
+    quote: Producer `identity_service`, consumer `notification_service`, topic `identity_events`,
+      key `user_id`; delivery at-least-once, consumers dedupe on `envelope.event_id`
+      and apply only if `account_version` is newer.
+relationships:
+- id: r-clients
+  source: clients
+  target: svc
+  type: request
+  interaction:
+    channel: direct
+    purpose: register, sign in, session and profile API calls
+    protocol: HTTP
+    exchange_id: clients-http
+  evidence:
+  - path: docs/architecture.md
+    quote: '| Auth handlers | HTTP surface for `/auth/*` (register, verify, login,
+      refresh, logout, logout-all, password reset) |'
+  - path: docs/openapi_spec.yaml
+    quote: Accounts, email verification, sign-in, session and refresh-token management,
+- id: r-peers
+  source: peers
+  target: svc
+  type: request
+  interaction:
+    channel: direct
+    purpose: public profile lookups
+    protocol: HTTP
+    exchange_id: peers-lookup
+  evidence:
+  - path: docs/architecture.md
+    quote: Synchronous HTTP flows
+  - path: docs/architecture.md
+    quote: used by the frontend and peer services to render names
+  - path: docs/architecture.md
+    quote: '`GET /users/lookup?username=` and `GET /users?ids=`'
+- id: r-verifiers
+  source: verifiers
+  target: svc
+  type: request
+  interaction:
+    channel: direct
+    purpose: token verification key fetch
+    protocol: HTTP
+    exchange_id: jwks-fetch
+  evidence:
+  - path: docs/architecture.md
+    quote: Synchronous HTTP flows
+  - path: docs/user_stories.md
+    quote: Given the service is running, when the JWKS endpoint is fetched, then it
+      returns the current and next public keys in standard JWKS form, unauthenticated.
+  - path: docs/architecture.md
+    quote: publishes current + next public keys at `GET /.well-known/jwks.json` so
+      every peer verifies tokens **locally** (no runtime call to this service).
+- id: r-db
+  source: svc
+  target: db
+  type: ownership
+  evidence:
+  - path: docs/architecture.md
+    quote: All tables are owned by this service.
+  - path: docs/architecture.md
+    quote: '**Statelessness:** all state lives in PostgreSQL; no local disk or in-memory
+      session state. Safe with `replicas >= 1`;'
+- id: r-resend
+  source: svc
+  target: resend
+  type: request
+  interaction:
+    channel: direct
+    purpose: transactional email delivery
+    exchange_id: resend-send
+  evidence:
+  - path: docs/architecture.md
+    quote: 'Emails: verification (on register / resend), password reset, password-changed
+      confirmation.'
+  - path: docs/architecture.md
+    quote: 'Failures: bounded exponential back-off on transient errors (429/5xx);
+      on final failure the user-facing flow returns "we couldn''t send the email,
+      try again" (`503 email_unavailable`) and the token is not consumed'
+- id: r-produce
+  source: svc
+  target: events
+  type: event
+  direction: forward
+  interaction:
+    channel: messaging
+    purpose: account change notification
+    protocol: Kafka
+  messaging:
+    role: producer
+    topic: identity_events
+  evidence:
+  - path: docs/architecture.md
+    quote: Asynchronous flows (Kafka producer)
+  - path: docs/architecture.md
+    quote: Producer `identity_service`, consumer `notification_service`, topic `identity_events`,
+      key `user_id`; delivery at-least-once, consumers dedupe on `envelope.event_id`
+      and apply only if `account_version` is newer.
+  - path: docs/architecture.md
+    quote: Publishing happens **after** the PostgreSQL transaction commits (transactional
+      outbox, §4); a failed publish is retried (at-least-once).
+view:
+  entities:
+  - clients
+  - peers
+  - verifiers
+  - svc
+  - db
+  - resend
+  - events
+  groups: []
+  edges:
+  - id: e-clients
+    source: clients
+    target: svc
+    relationships:
+    - r-clients
+    label: HTTP
+    flow: forward
+  - id: e-peers
+    source: peers
+    target: svc
+    relationships:
+    - r-peers
+    label: HTTP
+    flow: forward
+  - id: e-verifiers
+    source: verifiers
+    target: svc
+    relationships:
+    - r-verifiers
+    label: HTTP unauthenticated
+    flow: forward
+  - id: e-db
+    source: svc
+    target: db
+    relationships:
+    - r-db
+    label: SQL
+    flow: forward
+  - id: e-resend
+    source: svc
+    target: resend
+    relationships:
+    - r-resend
+    label: send email
+    flow: forward
+  - id: e-produce
+    source: svc
+    target: events
+    relationships:
+    - r-produce
+    label: 'Producers
+
+      identity_service:identity_events'
+    flow: forward
+  omitted: []
