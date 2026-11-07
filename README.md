@@ -1,1 +1,151 @@
-# 84f2-community-chat-voice-platform-identity-service
+# identity_service
+
+Stateless account and session service for the community platform. It owns
+registration, e-mail verification, sign-in, refresh-token rotation, session
+management, password reset and public profile lookup, and it is the only service
+that validates e-mail ownership.
+
+* Language / runtime: **Go 1.26**, single binary, no in-process user state.
+* HTTP: [gin](https://gin-gonic.com) with the OpenAPI contract in
+  `docs/openapi_spec.yaml`.
+* Persistence: PostgreSQL via [pgx/v5](https://github.com/jackc/pgx),
+  schema owned by [golang-migrate](https://github.com/golang-migrate/migrate)
+  migrations embedded in the binary.
+* Events: transactional outbox published to Kafka with
+  [IBM/sarama](https://github.com/IBM/sarama) (topic `identity_events`, contract
+  `EVT-001` / `user_account_changed` v1).
+* E-mail: [Resend](https://resend.com) through `resend-go/v4` with retry and
+  idempotency keys.
+* Auth: RS256 access tokens (15 min by default) with a rotating JWKS at
+  `/.well-known/jwks.json`; opaque, hashed, rotating refresh tokens in an
+  `HttpOnly; Secure; SameSite=Strict` cookie.
+* Observability: structured JSON logs (zap) with `trace_id`/`correlation_id`,
+  Prometheus metrics on the default registry, `/healthz` and `/readyz`.
+
+## Layout
+
+```
+cmd/server/            process wiring: config, migrations, pool, producer, HTTP, shutdown
+internal/config/       environment parsing and validation
+internal/models/       domain entities, API DTOs, error codes and UUID helpers
+internal/security/     Argon2id password hashing, opaque token generation/hashing
+internal/repository/   repository interfaces + pgx implementations, cursors
+migrations/            embedded SQL migrations (up/down)
+internal/service/      use cases: registration, login, refresh rotation, sessions, profiles, keys
+internal/handler/      gin router, middleware (trace, auth, metrics, recovery), error mapping
+internal/events/       EVT-001 envelope plus the outbox dispatcher and Kafka producer
+internal/email/        Resend adapter with retry/backoff and error classification
+internal/metrics/      Prometheus collectors
+internal/observability/ trace propagation and logging
+tests/mocks/           testify doubles for repositories, publisher, notifier and services
+tests/fakes/           in-memory repositories used by the service tests
+```
+
+## Build
+
+```bash
+make install     # go mod download
+make test        # go test ./... -race -count=1 -parallel 4
+make coverage    # writes coverage.out and prints the total
+go build ./...   # or: go run ./cmd/server
+make build       # docker build -t identity_service:local . (distroless, non-root)
+```
+
+The `Dockerfile` builds a static binary on `golang:1.26-alpine` and runs it on
+`gcr.io/distroless/static-debian12:nonroot`.
+
+## Run locally
+
+The service needs PostgreSQL and Kafka; both can be started with containers:
+
+```bash
+docker run -d --name identity-db -p 5432:5432 \
+  -e POSTGRES_USER=identity -e POSTGRES_PASSWORD=identity -e POSTGRES_DB=identity \
+  postgres:16
+
+docker run -d --name identity-kafka -p 9092:9092 \
+  -e KAFKA_CFG_NODE_ID=1 -e KAFKA_CFG_PROCESS_ROLES=broker,controller \
+  -e KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+  -e KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+  -e KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
+  -e KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+  -e KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+  -e ALLOW_PLAINTEXT_LISTENER=yes \
+  bitnami/kafka:3.7
+```
+
+Copy `.env.example` to `.env` (development only), fill in `RESEND_API_KEY`, then:
+
+```bash
+make run    # or: go run ./cmd/server
+curl -s localhost:8080/healthz
+curl -s localhost:8080/.well-known/jwks.json
+```
+
+Startup fails fast — with a single aggregated error — when configuration is
+invalid or PostgreSQL, migrations or Kafka are unreachable. Migrations run
+automatically before the HTTP server starts.
+
+### Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SERVICE_ENV` | `production` | `development` also loads `.env` |
+| `HTTP_ADDR` | `:8080` | listen address |
+| `SERVICE_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `DATABASE_URL` | – | PostgreSQL DSN (required) |
+| `KAFKA_BROKERS` | – | comma-separated broker list (required) |
+| `KAFKA_TOPIC_IDENTITY_EVENTS` | `identity_events` | event topic |
+| `RESEND_API_KEY`, `MAIL_FROM`, `APP_BASE_URL` | – | e-mail delivery (required) |
+| `JWT_ISSUER`, `JWT_AUDIENCE` | – | access-token `iss`/`aud` (required) |
+| `ACCESS_TOKEN_TTL` | `15m` | access-token lifetime |
+| `REFRESH_TOKEN_TTL` | `720h` | refresh-token lifetime |
+| `EMAIL_VERIFICATION_TOKEN_TTL` | `24h` | verification link lifetime |
+| `PASSWORD_RESET_TOKEN_TTL` | `1h` | reset link lifetime |
+| `SIGNING_KEY_ROTATION_INTERVAL` / `_OVERLAP` | `720h` / `1h` | JWKS rotation |
+| `LOGIN_MAX_FAILURES` / `LOGIN_SOURCE_MAX_FAILURES` | `5` / `20` | throttle thresholds |
+| `LOGIN_WINDOW` / `LOGIN_LOCKOUT` | `15m` / `15m` | throttle window and lockout |
+| `OUTBOX_POLL_INTERVAL` / `OUTBOX_BATCH_SIZE` | `1s` / `50` | outbox dispatcher |
+| `SHUTDOWN_TIMEOUT` | `20s` | graceful shutdown budget |
+| `REFRESH_COOKIE_NAME` / `REFRESH_COOKIE_PATH` | `refresh_token` / `/auth` | refresh cookie |
+
+## Endpoints
+
+`/auth/register`, `/auth/verify-email`, `/auth/verify-email/resend`,
+`/auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/logout-all`,
+`/auth/password-reset/request`, `/auth/password-reset/confirm`, `/sessions`
+(list/revoke), `/users/me` (get/patch), `/users/lookup`, `/users`, `/healthz`,
+`/readyz`, `/.well-known/jwks.json`. Every error answer is exactly
+`{"error": "<code>", "detail": "<human readable>"}`; the full contract lives in
+`docs/openapi_spec.yaml`.
+
+## Testing
+
+```bash
+make test                      # full suite, race detector on
+go test ./internal/service/... # one package
+make coverage                  # statement coverage total
+```
+
+The suite runs without PostgreSQL, Kafka, Resend or Docker:
+
+* `tests/fakes` provides in-memory repositories (with a deterministic
+  `clock.Fixed` injected) for the service-level flows, plus a recording
+  publisher and a fake notifier.
+* `tests/mocks` provides testify doubles for repository, publisher, notifier
+  and HTTP-service boundaries.
+* The Resend adapter is exercised through `httpmock`, including 429 retry,
+  permanent 4xx, provider outage and idempotency-key behaviour.
+
+## Operational notes
+
+* Sign-out, password reset and refresh-token reuse all revoke the session and
+  its whole refresh-token family (ADR-001); access tokens stay valid until they
+  expire (15 minutes), which callers must accept.
+* Registration is idempotent per `Idempotency-Key`: the account id is derived
+  from the key, so a retried request can never create a second account.
+* Account changes (`email_verified`, `profile_updated`, `deactivated`) are
+  written to `event_outbox` in the same transaction as the state change and
+  published afterwards — at-least-once, keyed by `user_id`.
+* `/healthz` never touches dependencies; `/readyz` fails while PostgreSQL or the
+  Kafka producer is unusable and as soon as shutdown starts.
