@@ -1,4 +1,6 @@
-server/
+# Compiled binary, not the source package: an unanchored `server/` pattern would
+# also discard the `cmd/server` entrypoint.
+/server
 *.exe
 *.test
 *.out
